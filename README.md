@@ -204,7 +204,7 @@ Update these values after training your models.
 
 ## 👨‍💻 Author
 
-**Rajesh R S**
+**Rakshitha M C**
 
 Bachelor of Computer Applications (BCA)
 
@@ -216,8 +216,7 @@ Skills:
 - Deep Learning
 
 GitHub:
-https://github.com/rajeshrs01/Sign-Language-Interpretation
-
+https://github.com/RAKSHITHA56410
 
 ---
 
