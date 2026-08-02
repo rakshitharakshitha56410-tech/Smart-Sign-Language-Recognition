@@ -1,0 +1,21 @@
+# ASL System v7.1 — Streamlit Edition
+# Install all dependencies:
+#   pip install -r requirements_streamlit.txt
+
+# ── Core Streamlit stack ──────────────────────────────────────────────────
+streamlit>=1.32.0
+streamlit-webrtc>=0.47.0       # real-time webcam via WebRTC
+av>=12.0.0                     # video frame handling (required by webrtc)
+streamlit-autorefresh>=1.0.1   # auto-refresh prediction panel every 400 ms
+
+# ── ML / vision ───────────────────────────────────────────────────────────
+mediapipe>=0.10.0
+tensorflow>=2.13.0             # or tensorflow-cpu for lighter install
+scipy>=1.11.0
+
+# ── TTS ───────────────────────────────────────────────────────────────────
+pyttsx3>=2.90                  # Windows/macOS/Linux TTS
+# On Linux also install: sudo apt install espeak  (fallback TTS)
+
+# ── Standard library used (no install needed) ─────────────────────────────
+# collections, threading, queue, time, os, pickle, json, re, urllib

@@ -1,0 +1,437 @@
+"""
+ASL NUMBER TRAINER
+==================
+Trains a recognition model on landmarks collected by number_collector.py
+
+Loads:
+  - JSON landmark files from sign_data/numbers/*/
+  - JPG images from sign_data/numbers/*/images/
+
+Outputs:
+  - numbers_model.h5       (trained neural net)
+  - numbers_labels.pkl     (label encoder)
+
+Usage:
+    python number_trainer.py
+"""
+
+import os
+import json
+import pickle
+import numpy as np
+import cv2
+from collections import defaultdict
+from pathlib import Path
+
+try:
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.model_selection import train_test_split
+    SK_OK = True
+except ImportError:
+    SK_OK = False
+    print("Install: pip install scikit-learn")
+
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
+    TF_OK = True
+except ImportError:
+    TF_OK = False
+    print("Install: pip install tensorflow")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "sign_data", "numbers")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+LANDMARK_DIM = 63  # 21 points × 3 (x, y, z)
+IMAGE_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS = 80
+VAL_SPLIT = 0.2
+TEST_SPLIT = 0.1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CUSTOM LAYER (from asl_system.py)
+# ─────────────────────────────────────────────────────────────────────────────
+if TF_OK:
+    class AttentionLayer(layers.Layer):
+        def __init__(self, units=128, **kwargs):
+            super().__init__(**kwargs)
+            self.units = units
+            self.Wq = layers.Dense(units, use_bias=False)
+            self.Wk = layers.Dense(units, use_bias=False)
+            self.Wv = layers.Dense(units, use_bias=False)
+
+        def call(self, x):
+            Q = self.Wq(x); K = self.Wk(x); V = self.Wv(x)
+            scale  = tf.math.sqrt(tf.cast(self.units, x.dtype))
+            scores = tf.linalg.matmul(Q, K, transpose_b=True) / scale
+            return tf.linalg.matmul(tf.nn.softmax(scores, axis=-1), V)
+
+        def get_config(self):
+            cfg = super().get_config()
+            cfg['units'] = self.units
+            return cfg
+
+    CUSTOM_OBJECTS = {'AttentionLayer': AttentionLayer}
+else:
+    CUSTOM_OBJECTS = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DATA LOADER
+# ─────────────────────────────────────────────────────────────────────────────
+class NumberDataLoader:
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.landmarks = []      # List of (label, features)
+        self.images = []         # List of (label, image_array)
+        self.labels_set = set()
+
+    def load_landmarks(self):
+        """Load normalized landmark data from JSON files."""
+        print("\n[LANDMARKS] Loading landmark data...")
+        count = 0
+        by_digit = defaultdict(int)
+
+        for digit_dir in sorted(Path(self.data_dir).iterdir()):
+            if not digit_dir.is_dir():
+                continue
+            digit = digit_dir.name
+            if digit not in '0123456789':
+                continue
+
+            json_files = list(digit_dir.glob('*.json'))
+            for json_file in json_files:
+                try:
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                    lbl = data.get('label', digit)
+                    lm = data.get('landmarks', [])
+                    if len(lm) == LANDMARK_DIM:
+                        self.landmarks.append((lbl, np.array(lm, dtype=np.float32)))
+                        self.labels_set.add(lbl)
+                        by_digit[digit] += 1
+                        count += 1
+                except Exception as e:
+                    print(f"  [SKIP] {json_file.name}: {e}")
+
+        print(f"  Loaded {count} landmark samples")
+        for digit in sorted(self.labels_set):
+            print(f"    Digit {digit}: {by_digit[digit]} samples")
+        return count > 0
+
+    def load_images(self):
+        """Load 224x224 image data."""
+        print("\n[IMAGES] Loading image data...")
+        count = 0
+        by_digit = defaultdict(int)
+
+        for digit_dir in sorted(Path(self.data_dir).iterdir()):
+            if not digit_dir.is_dir():
+                continue
+            digit = digit_dir.name
+            if digit not in '0123456789':
+                continue
+
+            img_dir = digit_dir / 'images'
+            if not img_dir.exists():
+                continue
+
+            img_files = list(img_dir.glob('*.jpg'))
+            for img_file in img_files:
+                try:
+                    img = cv2.imread(str(img_file))
+                    if img is None:
+                        continue
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+                    img = img.astype(np.float32) / 255.0
+                    self.images.append((digit, img))
+                    by_digit[digit] += 1
+                    count += 1
+                except Exception as e:
+                    print(f"  [SKIP] {img_file.name}: {e}")
+
+        print(f"  Loaded {count} image samples")
+        for digit in sorted(self.labels_set):
+            print(f"    Digit {digit}: {by_digit[digit]} samples")
+        return count > 0
+
+    def get_landmark_arrays(self):
+        """Return (X, y) for landmark model training."""
+        if not self.landmarks:
+            return None, None
+        X = np.array([lm for _, lm in self.landmarks], dtype=np.float32)
+        y = np.array([lbl for lbl, _ in self.landmarks], dtype=str)
+        return X, y
+
+    def get_image_arrays(self):
+        """Return (X, y) for image model training."""
+        if not self.images:
+            return None, None
+        X = np.array([img for _, img in self.images], dtype=np.float32)
+        y = np.array([lbl for lbl, _ in self.images], dtype=str)
+        return X, y
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODEL BUILDERS
+# ─────────────────────────────────────────────────────────────────────────────
+def build_landmark_model(input_dim, num_classes):
+    """CNN-like model for landmark data."""
+    model = keras.Sequential([
+        layers.Dense(128, activation='relu', input_shape=(input_dim,)),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+
+        layers.Dense(256, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+
+        layers.Dense(256, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+
+        layers.Dense(128, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.2),
+
+        layers.Dense(num_classes, activation='softmax'),
+    ])
+    return model
+
+
+def build_image_model(num_classes):
+    """MobileNetV2-based model for image recognition."""
+    base = keras.applications.MobileNetV2(
+        input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3),
+        include_top=False,
+        weights='imagenet'
+    )
+    base.trainable = False  # Freeze backbone initially
+
+    model = keras.Sequential([
+        keras.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3)),
+        base,
+        layers.GlobalAveragePooling2D(),
+        layers.Dense(256, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.4),
+        layers.Dense(128, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        layers.Dense(num_classes, activation='softmax'),
+    ])
+    return model
+
+
+def build_ensemble_model(input_dim, num_classes):
+    """Ensemble combining landmarks and images."""
+    # Landmark branch
+    lm_in = keras.Input(shape=(input_dim,), name='landmarks')
+    lm = layers.Dense(128, activation='relu')(lm_in)
+    lm = layers.BatchNormalization()(lm)
+    lm = layers.Dropout(0.3)(lm)
+    lm = layers.Dense(128, activation='relu')(lm)
+    lm = layers.BatchNormalization()(lm)
+    lm_out = layers.Dense(64, activation='relu')(lm)
+
+    # Image branch
+    img_in = keras.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3), name='images')
+    img = keras.applications.MobileNetV2(
+        input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3),
+        include_top=False,
+        weights='imagenet'
+    )(img_in)
+    img = layers.GlobalAveragePooling2D()(img)
+    img = layers.Dense(256, activation='relu')(img)
+    img = layers.BatchNormalization()(img)
+    img = layers.Dropout(0.3)(img)
+    img_out = layers.Dense(64, activation='relu')(img)
+
+    # Merge
+    merged = layers.Concatenate()([lm_out, img_out])
+    merged = layers.Dense(128, activation='relu')(merged)
+    merged = layers.BatchNormalization()(merged)
+    merged = layers.Dropout(0.3)(merged)
+    out = layers.Dense(num_classes, activation='softmax')(merged)
+
+    model = keras.Model(inputs=[lm_in, img_in], outputs=out)
+    return model
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TRAINING
+# ─────────────────────────────────────────────────────────────────────────────
+def train_landmark_model(X, y, num_classes):
+    """Train standalone landmark model."""
+    print("\n" + "="*70)
+    print("TRAINING LANDMARK MODEL")
+    print("="*70)
+
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y)
+
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y_enc, test_size=(VAL_SPLIT + TEST_SPLIT), random_state=42
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=(TEST_SPLIT / (VAL_SPLIT + TEST_SPLIT)), random_state=42
+    )
+
+    print(f"Training set: {X_train.shape[0]}")
+    print(f"Validation set: {X_val.shape[0]}")
+    print(f"Test set: {X_test.shape[0]}")
+
+    model = build_landmark_model(X.shape[1], num_classes)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    print("\nModel summary:")
+    model.summary()
+
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        verbose=1,
+    )
+
+    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    print(f"\nTest accuracy: {test_acc:.4f}")
+
+    model_path = os.path.join(MODELS_DIR, 'numbers_landmarks_model.h5')
+    labels_path = os.path.join(MODELS_DIR, 'numbers_landmarks_labels.pkl')
+    model.save(model_path)
+    with open(labels_path, 'wb') as f:
+        pickle.dump(le, f)
+
+    print(f"\nSaved: {model_path}")
+    print(f"Saved: {labels_path}")
+    return model, le
+
+
+def train_image_model(X, y, num_classes):
+    """Train standalone image model."""
+    print("\n" + "="*70)
+    print("TRAINING IMAGE MODEL")
+    print("="*70)
+
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y)
+
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y_enc, test_size=(VAL_SPLIT + TEST_SPLIT), random_state=42
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=(TEST_SPLIT / (VAL_SPLIT + TEST_SPLIT)), random_state=42
+    )
+
+    print(f"Training set: {X_train.shape[0]}")
+    print(f"Validation set: {X_val.shape[0]}")
+    print(f"Test set: {X_test.shape[0]}")
+
+    model = build_image_model(num_classes)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    print("\nModel summary:")
+    model.summary()
+
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        verbose=1,
+    )
+
+    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    print(f"\nTest accuracy: {test_acc:.4f}")
+
+    model_path = os.path.join(MODELS_DIR, 'numbers_images_model.h5')
+    labels_path = os.path.join(MODELS_DIR, 'numbers_images_labels.pkl')
+    model.save(model_path)
+    with open(labels_path, 'wb') as f:
+        pickle.dump(le, f)
+
+    print(f"\nSaved: {model_path}")
+    print(f"Saved: {labels_path}")
+    return model, le
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    print("\n" + "="*70)
+    print("ASL NUMBER TRAINER")
+    print("="*70)
+
+    if not SK_OK or not TF_OK:
+        print("[ERROR] Missing dependencies. Install with:")
+        print("  pip install scikit-learn tensorflow")
+        return
+
+    # Check data directory
+    if not os.path.exists(DATA_DIR):
+        print(f"\n[ERROR] No data directory: {DATA_DIR}")
+        print("Run number_collector.py first to collect samples.")
+        return
+
+    # Load data
+    loader = NumberDataLoader(DATA_DIR)
+    lm_ok = loader.load_landmarks()
+    img_ok = loader.load_images()
+
+    if not (lm_ok or img_ok):
+        print("\n[ERROR] No data loaded. Collect samples with number_collector.py")
+        return
+
+    num_classes = len(loader.labels_set)
+    print(f"\nNumber of classes: {num_classes}")
+
+    # Train landmark model
+    if lm_ok:
+        X_lm, y_lm = loader.get_landmark_arrays()
+        lm_model, lm_le = train_landmark_model(X_lm, y_lm, num_classes)
+
+    # Train image model
+    if img_ok:
+        X_img, y_img = loader.get_image_arrays()
+        img_model, img_le = train_image_model(X_img, y_img, num_classes)
+
+    print("\n" + "="*70)
+    print("TRAINING COMPLETE")
+    print("="*70)
+    print("\nNext steps:")
+    print("  1. Review model metrics above")
+    print("  2. Update asl_system.py to load number models (optional)")
+    print("  3. Run:  python asl_system.py")
+    print("="*70 + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
